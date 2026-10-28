@@ -1,0 +1,8 @@
+.env
+dumps/*
+!dumps/.gitkeep
+__pycache__/
+*.pyc
+mlruns/
+mlartifacts/
+.venv/

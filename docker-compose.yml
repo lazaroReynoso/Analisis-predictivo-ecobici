@@ -1,0 +1,142 @@
+# Ecobici MLOps — todo el stack con un solo comando:
+#     cp .env.example .env      (y completar la contraseña)
+#     docker compose up --build
+#
+#   Postgres  → localhost:5433   (5433 para no chocar con un Postgres local)
+#   MLflow UI → http://localhost:5000
+#   API       → http://localhost:8000/docs
+#
+# Orden: postgres → etl (carga datos) → mlflow → trainer → api → drift-monitor
+
+x-app-env: &app-env
+  DB_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  MLFLOW_URI: http://mlflow:5000
+  API_URL: http://api:8000
+  TZ: America/Argentina/Buenos_Aires
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./dumps:/dumps:ro
+    healthcheck:
+      # -h 127.0.0.1 obliga a conectarse por red: durante la restauración del dump
+      # Postgres solo escucha por socket interno, así que esto falla hasta que termina.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30m     # tiempo de gracia para restaurar el dump la primera vez
+    restart: unless-stopped
+
+  mlflow:
+    build: ./docker/mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/mlflow
+      --artifacts-destination /mlartifacts
+      --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlartifacts:/mlartifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # Carga lo que falte (todo, si la base está vacía) y termina.
+  etl:
+    build: .
+    command: python etl.py
+    environment:
+      <<: *app-env
+      ECOBICI_CLIENT_ID: ${ECOBICI_CLIENT_ID:-}
+      ECOBICI_CLIENT_SECRET: ${ECOBICI_CLIENT_SECRET:-}
+      VIAJES_URLS_EXTRA: ${VIAJES_URLS_EXTRA:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Entrena solo si no hay modelos registrados todavía, y termina.
+  trainer:
+    build: .
+    command: python train_if_needed.py
+    environment:
+      <<: *app-env
+      DEVICE: ${DEVICE:-cpu}
+      OPTUNA_TRIALS: ${OPTUNA_TRIALS:-30}
+      FORCE_TRAIN: ${FORCE_TRAIN:-false}
+    depends_on:
+      etl:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  api:  
+    build: .
+    environment:
+      <<: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      trainer:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # Queda corriendo y cada semana (DRIFT_WEEKDAY / DRIFT_HOUR) evalúa el modelo.
+  drift-monitor:
+    build: .
+    command: python drift_monitor.py --schedule
+    environment:
+      <<: *app-env
+      DEVICE: ${DEVICE:-cpu}
+      OPTUNA_TRIALS: ${OPTUNA_TRIALS:-30}
+      RMSE_THRESHOLD_PCT: ${RMSE_THRESHOLD_PCT:-0.20}
+      EVAL_DAYS: ${EVAL_DAYS:-7}
+      DRIFT_WEEKDAY: ${DRIFT_WEEKDAY:-0}
+      DRIFT_HOUR: ${DRIFT_HOUR:-6}
+      RUN_ON_START: ${RUN_ON_START:-false}
+      AUTO_RETRAIN: ${AUTO_RETRAIN:-false}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      RUN_ETL: ${RUN_ETL:-true}
+      ECOBICI_CLIENT_ID: ${ECOBICI_CLIENT_ID:-}
+      ECOBICI_CLIENT_SECRET: ${ECOBICI_CLIENT_SECRET:-}
+      VIAJES_URLS_EXTRA: ${VIAJES_URLS_EXTRA:-}
+    depends_on:
+      trainer:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  mlartifacts:

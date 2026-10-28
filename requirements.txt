@@ -1,0 +1,18 @@
+# Versiones fijas = mismo resultado en cualquier máquina.
+# Si en tu entorno local usás otras, reemplazalas por las de `pip freeze`
+# (sobre todo xgboost y mlflow, para que el modelo cargue igual).
+mlflow==3.17.0
+xgboost==3.4.1
+optuna==4.5.0
+scikit-learn==1.9.1
+pandas==3.0.6
+numpy==2.5.3
+pyarrow==25.0.1
+matplotlib==3.11.2
+SQLAlchemy==2.1.3
+psycopg[binary]==3.3.6
+requests==2.33.1
+shapely==2.1.2
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
